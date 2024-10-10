@@ -2,10 +2,12 @@
 
 # Author: K. Walsh <kwalsh@cs.holycross.edu>
 # Date: 15 January 2015
-# Modified 25 Spetember 2024 by Peyton Ellinghaus
-#   added sharks page, implemented cookies, implemented personal interactive greeting, etc.
 # Updated: 17 September 2020 - update to python3, add classes
 # Updated: 15 September 2022 - bug fixes
+# Modified 25 Spetember 2024 by Peyton Ellinghaus
+#   added sharks page, implemented cookies, implemented personal interactive greeting, etc.
+# Modified 11 October by Peyton Ellinghaus
+#   implementation for Whisper app
 
 # A simple web server from scratch in Python. Run it like this:
 #   python3 webserver.py  localhost  8888
@@ -229,7 +231,36 @@ class Connection:
             log("Error reading from client %s socket" % (self.client_addr))
             self.leftover_data = data # save it all for later
             return None
+            
+# Topic objects are used to keep track of attributes for each topic (likes, count, etc)
+updates = threading.Condition()
+topics_lock = threading.Condition()
+topic_lock = threading.Condition()
 
+class Topic:
+    def __init__(self, name):
+        self.name = name
+        self.msgcount = 0
+        self.likes = 0
+        self.messages = []
+        self.versionPerTopic = 0
+
+    def addMessage(self, msg):
+        with updates: 
+            self.messages.append(msg)
+            self.msgcount += 1
+            updates.notify_all()
+
+    def addLike(self):
+        with updates:
+            self.likes += 1
+            updates.notify_all()
+
+
+
+# Default topic list and version 
+topics = [Topic("snoopy"), Topic("holycross"), Topic("CS")]
+topics_version = 0
 
 # log(msg) prints a message to standard output. Since multi-threading can jumble
 # up the order of output on the screen, we print out the current thread's name
@@ -392,11 +423,13 @@ def handle_one_http_request(conn):
     # Finally, look at the method and path to decide what to do.
     if req.method == "GET":
         resp = handle_http_get(req, conn)
-    elif req.method == "POST" or req.method == "PUT":
-        log("HTTP method '%s' is not yet supported by this server" % (req.method))
+    elif req.method == "POST":
+        resp = handle_http_post(req)
+    elif req.method == "PUT":
+        log("HTTP method PUT is not yet supported by this server")
         resp = Response("405 METHOD NOT ALLOWED",
                 "text/plain",
-                "PUT and POST methods not yet supported")
+                "PUT method not yet supported")
     else:
         log("HTTP method '%s' is not recognized by this server" % (req.method))
         resp = Response("405 METHOD NOT ALLOWED",
@@ -451,7 +484,6 @@ def send_http_response(conn, resp):
         log("\n====BEGIN BODY====\n" + make_printable(body) + "=====END BODY====")
         conn.sock.sendall(body)
 
-
 # handle_http_get_status() returns a response for GET /status
 def handle_http_get_status(conn):
     log("Handling http get status request")
@@ -470,7 +502,6 @@ def handle_http_get_status(conn):
     msg += str(conn.num_requests) + " requests handled on this connection so far\n"
     msg +=  "%.3f s elapsed since start of this connection\n" % (time.time() - conn.start_time)
     return Response("200 OK", "text/plain", msg)
-
 
 # handle_http_get_hello() returns a response for GET /hello
 # this function uses cookies to keep track of the total visits the user has made, as well as saving the user's
@@ -585,7 +616,6 @@ def handle_http_get_sharks():
     msg += f'<p style="text-align:center">{captions[selected_image]}</p></body></html>'
     return Response("200 OK", "text/html", msg)
 
-
 # handle_http_get_file() returns an appropriate response for a GET request that
 # seems to be for a file, rather than a special URL. If the file can't be found,
 # or if there are any problems, an error response is generated.
@@ -636,7 +666,6 @@ def handle_http_get_file(url_path):
         log("Error encountered reading from file")
         return Response("403 FORBIDDEN", "text/plain", "Permission denied: " + url_path)
 
-
 # handle_http_get() returns an appropriate response for a GET request
 def handle_http_get(req, conn):
     # Generate a response
@@ -679,6 +708,15 @@ def handle_http_get(req, conn):
         resp = handle_http_get_quote()
     elif req.path == "/sharks":
         resp = handle_http_get_sharks()
+    elif req.path.startswith("/whisper/topics?version"):
+        path = req.path
+        splitpath = path.split("=")
+        if len(splitpath) == 2:
+            version = int(splitpath[1])
+            resp = handle_http_get_topic_list(version)
+    elif req.path.startswith("/whisper/feed/"):
+        resp = handle_http_message_feed(req)
+        return resp
     elif req.path == "/":
         req_path = req.path + "index.html"
         file_path = server_root + req_path
@@ -697,6 +735,16 @@ def handle_http_get(req, conn):
     else:
         resp = handle_http_get_file(req.path)
     return resp
+
+# handle_http_post() returns an appropriate response for a POST request
+def handle_http_post(req):
+    if req.path == "/whisper/messages":
+        resp = handle_http_post_message(req)
+        return resp
+    elif req.path.startswith("/whisper/like/"):
+        resp = handle_http_like(req)
+        return resp
+    
 
 # handle_http_connection() reads one or more HTTP requests from a client, parses
 # each one, and sends back appropriate responses to the client.
@@ -726,11 +774,161 @@ def handle_http_connection(conn):
         with stats.lock: # update overall server statistics
             stats.active_connections -= 1
 
+# handle_get_topic_list() returns a plain text response that includes information
+# about the requsted topic
+def handle_http_get_topic_list(version):
+    global topics
+    global topics_version
+
+    log("Handling http get topic list request")
+    with updates:
+        while topics_version < version:
+            updates.wait()
+
+    # REACH GOAL: sort list by most liked messages
+    def getKey(topic):
+        return topic.likes
+    
+    with topics_lock:
+        topics.sort(key = getKey, reverse = True)
+        topics_lock.notify_all()
+
+    msg = f'{version}\n'
+    for topic in topics:
+        msg += f'{topic.msgcount} {topic.likes} {topic.name}\n'
+    resp = Response("200 OK", "text/plain", msg)
+    return resp
+
+# handle_http_post_message() posts a given message
+def handle_http_post_message(req):
+    global topics
+    global topics_version
+
+    log("Handling http post message request")
+
+    msg_body = req.body
+    lines = msg_body.split("\n")
+
+    if len(lines) < 2:
+        return Response("400 BAD REQUEST", "text/plain", "The request was not formatted properly.")
+    
+    if not lines[0].startswith("tags... ") or not lines[1].startswith("message... "):
+        return Response("400 BAD REQUEST", "text/plain", "The request was not formatted properly.")
+
+    tags = lines[0].strip()
+    msg = lines[1].strip()
+
+    tags1 = tags[8:]
+    msg_content = msg[11:]
+
+    if msg_content.strip() == "":
+        return Response("200 OK", "text/plain", "The message was empty so it was ignored.")
+    
+    if tags1.strip() == "":
+        return Response("400 BAD REQUEST", "text/plain", "The message has no tags.")
+
+    tags = tags1.split(" ")
+
+    with topics_lock:
+        for tag in tags:
+            exists = False
+            for topic in topics:
+                if topic.name == tag:
+                    exists = True
+                    newTopic = topic
+                    break
+            if exists == False:
+                newTopic = Topic(tag)
+                topics.append(newTopic)
+            with topic_lock:
+                # REACH GOAL: limit by recency
+                if newTopic.msgcount >= 10:
+                    newTopic.messages.pop(0)
+                newTopic.addMessage(msg_content)
+                newTopic.versionPerTopic += 1
+                topic_lock.notify_all()
+        topics_version += 1
+        topics_lock.notify_all()
+    return Response("200 OK", "text/plain", "success")
+            
+# handle_http_message_feed() displays the messages for a given topic
+def handle_http_message_feed(req):
+    global topics
+
+    log ("Handling http message feed request")
+
+    path = req.path.split("/")
+
+    if path[0] == '' and path[1] == "whisper" and path[2] == "feed":
+        part = path[3]
+    else:
+        return Response("400 BAD REQUEST", "text/plain", "Incorrect request format.")
+    
+    part1 = part.split("?")
+    chosenTopic = part1[0]
+
+    with topics_lock:
+        isTopic = False
+        for topic in topics:
+            if chosenTopic == topic.name:
+                isTopic = True
+                chosenTopic = topic
+                break
+    
+    if isTopic == False:
+        return Response("404 NOT FOUND", "text/plain", "The chosen topic does not exist")
+
+    part2 = part1[1]
+    part3 = part2.split("=")
+    version = int(part3[1])
+
+    with updates:
+        while chosenTopic.versionPerTopic < version:
+            updates.wait()
+
+
+    msg = f'{chosenTopic.versionPerTopic}\n'
+    for post in chosenTopic.messages:
+        msg += f'- {post}\n'
+
+    return Response("200 OK", "text/plain", msg)
+
+# handle_http_like() allows users to like a topic
+def handle_http_like(req):
+    global topics 
+    global topics_version
+
+    log("Handling http like request")
+
+    parts = req.path.split("/")
+
+    if parts[0] == '' and parts[1] == "whisper" and parts[2] == "like":
+        potentialTopic = parts[3]
+    else:
+        return Response("400 BAD REQUEST", "text/plain", "Incorrect request format.")
+    
+    with topics_lock:
+        isTopic = False
+        for topic in topics:
+            if potentialTopic == topic.name:
+                isTopic = True
+                likedTopic = topic
+                topics_version += 1
+                topics_lock.notify_all()
+                break
+    
+    if isTopic == False:
+        return Response("404 NOT FOUND", "text/plain", "The chosen topic does not exist")
+    
+    with topic_lock:
+        likedTopic.addLike()
+        topic_lock.notify_all()
+
+    return Response("200 OK", "text/plain", "success")
 
 # This remainder of this file is the main program, which listens on a server
 # socket for incoming connections from clients, and starts a handler thread for
 # each one.
-
 
 # Get command-line parameters
 if len(sys.argv) not in [3, 4]:
@@ -779,10 +977,8 @@ server_addr = (server_ip, server_port)
 s.bind(server_addr)
 s.listen(5)
 
-log("Server can be accessed at URLs such as:")
-log(f"    http://{server_host}:{server_port}/")
-log(f"    http://{server_host}:{server_port}/welcome.html")
-log(f"    http://{server_host}:{server_port}/status.html")
+log("Server can be accessed at:")
+log(f"    http://{server_host}:{server_port}/whisper.html")
 log("Ready for connections...")
 
 try:
